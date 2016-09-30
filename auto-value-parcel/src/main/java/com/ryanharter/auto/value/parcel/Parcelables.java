@@ -8,14 +8,18 @@ import com.squareup.javapoet.FieldSpec;
 import com.squareup.javapoet.ParameterSpec;
 import com.squareup.javapoet.ParameterizedTypeName;
 import com.squareup.javapoet.TypeName;
+import com.squareup.javapoet.TypeVariableName;
+
 import java.util.List;
 import java.util.Set;
+
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
+import javax.lang.model.type.TypeVariable;
 import javax.lang.model.util.SimpleTypeVisitor6;
 import javax.lang.model.util.SimpleTypeVisitor7;
 import javax.lang.model.util.Types;
@@ -137,15 +141,23 @@ final class Parcelables {
   /**
    * Returns the component of the type that is Parcelable, or descends from a Parcelable type.
    */
-  private static TypeName getParcelableComponent(final Types types, final TypeMirror type) {
-    return type.accept(new SimpleTypeVisitor7<TypeName, Void>() {
-      @Override public TypeName visitDeclared(DeclaredType t, Void aVoid) {
-        TypeName type = TypeName.get(t);
-        while (type instanceof ParameterizedTypeName && !((ParameterizedTypeName) type).typeArguments.isEmpty()) {
-          List<TypeName> args = ((ParameterizedTypeName) type).typeArguments;
-          type = args.get(args.size() - 1);
+  private static TypeName getParcelableComponent(final Types types, TypeMirror type) {
+    final TypeMirror typeFinal;
+    if (type.getKind() == TypeKind.TYPEVAR) {
+      TypeVariable vType = (TypeVariable) type;
+      typeFinal = vType.getUpperBound();
+    } else {
+      typeFinal = type;
+    }
+    return typeFinal.accept(new SimpleTypeVisitor7<TypeName, Void>() {
+      @Override
+      public TypeName visitDeclared(DeclaredType t, Void aVoid) {
+        TypeName typeFinal = TypeName.get(t);
+        while (typeFinal instanceof ParameterizedTypeName && !((ParameterizedTypeName) typeFinal).typeArguments.isEmpty()) {
+          List<TypeName> args = ((ParameterizedTypeName) typeFinal).typeArguments;
+          typeFinal = args.get(args.size() - 1);
         }
-        return type;
+        return typeFinal;
       }
 
       @Override public TypeName visitArray(ArrayType t, Void aVoid) {
@@ -161,7 +173,8 @@ final class Parcelables {
 
   static void readValue(CodeBlock.Builder block, AutoValueParcelExtension.Property property,
       final TypeName parcelableType, Types types) {
-    if (property.nullable()){
+    boolean needsNullCheck = needsNullCheck(property, parcelableType);
+    if (needsNullCheck){
       block.add("in.readInt() == 0 ? ");
     }
 
@@ -184,7 +197,10 @@ final class Parcelables {
     } else if (parcelableType.equals(TypeName.BOOLEAN) || parcelableType.equals(TypeName.BOOLEAN.box())) {
       block.add("in.readInt() == 1");
     } else if (parcelableType.equals(PARCELABLE)) {
-      if (property.type.equals(PARCELABLE)) {
+      TypeName check = property.type instanceof TypeVariableName
+              ? ((TypeVariableName) property.type).bounds.get(0)
+              : property.type;
+      if (check.equals(PARCELABLE)) {
         block.add("in.readParcelable($T.class.getClassLoader())",
             getParcelableComponent(types, property.element.getReturnType()));
       } else {
@@ -255,7 +271,7 @@ final class Parcelables {
           getParcelableComponent(types, property.element.getReturnType()));
     }
 
-    if (property.nullable()){
+    if (needsNullCheck){
       block.add(" : null");
     }
   }
@@ -276,27 +292,25 @@ final class Parcelables {
       ParameterSpec out, ParameterSpec flags) {
     CodeBlock.Builder block = CodeBlock.builder();
 
-    if (property.nullable()) {
+    TypeName type = getTypeNameFromProperty(property, types);
+
+    boolean needsNullCheck = needsNullCheck(property, type);
+    if (needsNullCheck) {
       block.beginControlFlow("if ($N() == null)", property.methodName);
       block.addStatement("$N.writeInt(1)", out);
       block.nextControlFlow("else");
       block.addStatement("$N.writeInt(0)", out);
     }
 
-    final TypeName type = getTypeNameFromProperty(property, types);
-
     if (type.equals(STRING))
       block.add("$N.writeString($N())", out, property.methodName);
-    else if (type.equals(TypeName.BYTE) || type.equals(TypeName.BYTE.box()))
+    else if (type.equals(TypeName.BYTE) || type.equals(TypeName.BYTE.box())
+        || type.equals(TypeName.INT) || type.equals(TypeName.INT.box())
+        || type.equals(TypeName.CHAR) || type.equals(TypeName.CHAR.box())
+        || type.equals(TypeName.SHORT))
       block.add("$N.writeInt($N())", out, property.methodName);
-    else if (type.equals(TypeName.INT) || type.equals(TypeName.INT.box()))
-      block.add("$N.writeInt($N())", out, property.methodName);
-    else if (type.equals(TypeName.SHORT))
-      block.add("$N.writeInt(((Short) $N()).intValue())", out, property.methodName);
     else if (type.equals(TypeName.SHORT.box()))
       block.add("$N.writeInt($N().intValue())", out, property.methodName);
-    else if (type.equals(TypeName.CHAR) || type.equals(TypeName.CHAR.box()))
-      block.add("$N.writeInt($N())", out, property.methodName);
     else if (type.equals(TypeName.LONG) || type.equals(TypeName.LONG.box()))
       block.add("$N.writeLong($N())", out, property.methodName);
     else if (type.equals(TypeName.FLOAT) || type.equals(TypeName.FLOAT.box()))
@@ -352,11 +366,22 @@ final class Parcelables {
 
     block.add(";\n");
 
-    if (property.nullable()) {
+    if (needsNullCheck) {
       block.endControlFlow();
     }
 
     return block.build();
+  }
+
+  private static boolean needsNullCheck(AutoValueParcelExtension.Property property, TypeName type) {
+    return property.nullable()
+        && !type.equals(BUNDLE)
+        && !type.equals(LIST)
+        && !type.equals(MAP)
+        && !type.equals(PARCELABLE)
+        && !type.equals(PERSISTABLEBUNDLE)
+        && !type.equals(SPARSEARRAY)
+        && !type.equals(SPARSEBOOLEANARRAY);
   }
 
   public static CodeBlock writeValueWithTypeAdapter(FieldSpec adapter, AutoValueParcelExtension.Property property, ParameterSpec out) {
@@ -380,6 +405,10 @@ final class Parcelables {
 
   static TypeName getTypeNameFromProperty(AutoValueParcelExtension.Property property, Types types) {
     TypeMirror returnType = property.element.getReturnType();
+    if (returnType.getKind() == TypeKind.TYPEVAR) {
+      TypeVariable vType = (TypeVariable) returnType;
+      returnType = vType.getUpperBound();
+    }
     TypeElement element = (TypeElement) types.asElement(returnType);
     if (element != null) {
       TypeName parcelableType = getParcelableType(types, element);
